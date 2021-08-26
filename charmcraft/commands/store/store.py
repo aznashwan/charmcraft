@@ -20,6 +20,7 @@ import logging
 import time
 from collections import namedtuple
 
+from craft_store import attenuations
 from dateutil import parser
 
 from charmcraft.commands.store.client import Client
@@ -121,23 +122,31 @@ class Store:
 
             - exercise the simplest command regarding developer identity
         """
-        self._client.clear_credentials()
-        self._client.get("/v1/whoami")
+        self._client.logout()
+        self._client.login(
+            token_request={
+                "ttl": 3600,
+                "description": "exchanged-macaroon-test",
+                "permissions": [
+                    attenuations.ACCOUNT_REGISTER_PACKAGE,
+                    attenuations.ACCOUNT_VIEW_PACKAGES,
+                    attenuations.PACKAGE_MANAGE,
+                    attenuations.PACKAGE_VIEW,
+                ],
+            }
+        )
 
     def logout(self):
         """Logout from the store.
 
         There's no action really in the Store to logout, we just remove local credentials.
         """
-        self._client.clear_credentials()
+        self._client.logout()
 
     def whoami(self):
         """Return authenticated user details."""
-        response = self._client.get("/v1/whoami")
-        # XXX Facundo 2020-06-30: Every time we consume data from the Store (after a succesful
-        # call) we need to wrap it with a context manager that will raise UnknownError (after
-        # logging in debug the received response). This would catch API changes, for example,
-        # without making charmcraft to badly crash. Related: issue #73.
+        response = self._client.whoami()
+
         result = User(
             name=response["display-name"],
             username=response["username"],
@@ -147,11 +156,11 @@ class Store:
 
     def register_name(self, name, entity_type):
         """Register the specified name for the authenticated user."""
-        self._client.post("/v1/charm", {"name": name, "type": entity_type})
+        self._client.post("/v1/charm", json={"name": name, "type": entity_type})
 
     def list_registered_names(self):
         """Return names registered by the authenticated user."""
-        response = self._client.get("/v1/charm")
+        response = self._client.request_json("GET", "/v1/charm")
         result = []
         for item in response["results"]:
             result.append(
@@ -166,16 +175,16 @@ class Store:
 
     def _upload(self, endpoint, filepath, *, extra_fields=None):
         """Upload for all charms, bundles and resources (generic process)."""
-        upload_id = self._client.push(filepath)
+        upload_id = self._client.push_file(filepath)
         payload = {"upload-id": upload_id}
         if extra_fields is not None:
             payload.update(extra_fields)
-        response = self._client.post(endpoint, payload)
+        response = self._client.request_json("POST", endpoint, json=payload)
         status_url = response["status-url"]
         logger.debug("Upload %s started, got status url %s", upload_id, status_url)
 
         while True:
-            response = self._client.get(status_url)
+            response = self._client.request_json("GET", status_url)
             logger.debug("Status checked: %s", response)
 
             # as we're asking for a single upload_id, the response will always have only one item
@@ -196,17 +205,17 @@ class Store:
 
     def upload(self, name, filepath):
         """Upload the content of filepath to the indicated charm."""
-        endpoint = "/v1/charm/{}/revisions".format(name)
+        endpoint = f"/v1/charm/{name}/revisions"
         return self._upload(endpoint, filepath)
 
     def upload_resource(self, charm_name, resource_name, resource_type, filepath):
         """Upload the content of filepath to the indicated resource."""
-        endpoint = "/v1/charm/{}/resources/{}/revisions".format(charm_name, resource_name)
+        endpoint = f"/v1/charm/{charm_name}/resources/{resource_name}/revisions"
         return self._upload(endpoint, filepath, extra_fields={"type": resource_type})
 
     def list_revisions(self, name):
         """Return charm revisions for the indicated charm."""
-        response = self._client.get("/v1/charm/{}/revisions".format(name))
+        response = self._client.request_json("GET", f"/v1/charm/{name}/revisions")
         result = [_build_revision(item) for item in response["revisions"]]
         return result
 
@@ -218,12 +227,12 @@ class Store:
             {"revision": revision, "channel": channel, "resources": resources}
             for channel in channels
         ]
-        self._client.post(endpoint, items)
+        self._client.post(endpoint, json=items)
 
     def list_releases(self, name):
         """List current releases for a package."""
         endpoint = "/v1/charm/{}/releases".format(name)
-        response = self._client.get(endpoint)
+        response = self._client.request_json("GET", endpoint)
 
         channel_map = []
         for item in response["channel-map"]:
@@ -260,28 +269,28 @@ class Store:
 
     def create_library_id(self, charm_name, lib_name):
         """Create a new library id."""
-        endpoint = "/v1/charm/libraries/{}".format(charm_name)
-        response = self._client.post(endpoint, {"library-name": lib_name})
+        endpoint = f"/v1/charm/libraries/{charm_name}"
+        response = self._client.request_json("POST", endpoint, {"library-name": lib_name})
         lib_id = response["library-id"]
         return lib_id
 
     def create_library_revision(self, charm_name, lib_id, api, patch, content, content_hash):
         """Create a new library revision."""
-        endpoint = "/v1/charm/libraries/{}/{}".format(charm_name, lib_id)
+        endpoint = f"/v1/charm/libraries/{charm_name}/{lib_id}"
         payload = {
             "api": api,
             "patch": patch,
             "content": content,
             "hash": content_hash,
         }
-        response = self._client.post(endpoint, payload)
+        response = self._client.request_json("POST", endpoint, json=payload)
         result = _build_library(response)
         return result
 
     def get_library(self, charm_name, lib_id, api):
         """Get the library tip by id for a given api version."""
-        endpoint = "/v1/charm/libraries/{}/{}?api={}".format(charm_name, lib_id, api)
-        response = self._client.get(endpoint)
+        endpoint = f"/v1/charm/libraries/{charm_name}/{lib_id}?api={api}"
+        response = self._client.request_json("GET", endpoint)
         result = _build_library(response)
         return result
 
@@ -309,30 +318,28 @@ class Store:
             if "api" in lib:
                 item["api"] = lib["api"]
             payload.append(item)
-        response = self._client.post(endpoint, payload)
+        response = self._client.request_json("POST", endpoint, json=payload)
         libraries = response["libraries"]
         result = {(item["library-id"], item["api"]): _build_library(item) for item in libraries}
         return result
 
     def list_resources(self, charm):
         """Return resources associated to the indicated charm."""
-        response = self._client.get("/v1/charm/{}/resources".format(charm))
+        response = self._client.request_json("GET", f"/v1/charm/{charm}/resources")
         result = [_build_resource(item) for item in response["resources"]]
         return result
 
     def list_resource_revisions(self, charm_name, resource_name):
         """Return revisions for the indicated charm resource."""
-        endpoint = "/v1/charm/{}/resources/{}/revisions".format(charm_name, resource_name)
-        response = self._client.get(endpoint)
+        endpoint = f"/v1/charm/{charm_name}/resources/{resource_name}/revisions"
+        response = self._client.request_json("GET", endpoint)
         result = [_build_resource_revision(item) for item in response["revisions"]]
         return result
 
     def get_oci_registry_credentials(self, charm_name, resource_name):
         """Get credentials to upload a resource to the Canonical's OCI Registry."""
-        endpoint = "/v1/charm/{}/resources/{}/oci-image/upload-credentials".format(
-            charm_name, resource_name
-        )
-        response = self._client.get(endpoint)
+        endpoint = f"/v1/charm/{charm_name}/resources/{resource_name}/oci-image/upload-credentials"
+        response = self._client.request_json("GET", endpoint)
         return RegistryCredentials(
             image_name=response["image-name"],
             username=response["username"],
@@ -342,7 +349,7 @@ class Store:
     def get_oci_image_blob(self, charm_name, resource_name, digest):
         """Get the blob that points to the OCI image in the Canonical's OCI Registry."""
         payload = {"image-digest": digest}
-        endpoint = "/v1/charm/{}/resources/{}/oci-image/blob".format(charm_name, resource_name)
-        content = self._client.post(endpoint, payload, parse_json=False)
+        endpoint = f"/v1/charm/{charm_name}/resources/{resource_name}/oci-image/blob"
+        content = self._client.get(endpoint, json=payload).text
         # the response here is returned as is, because it's opaque to charmcraft
         return content
